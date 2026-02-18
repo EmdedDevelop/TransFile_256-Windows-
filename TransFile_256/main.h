@@ -23,7 +23,7 @@ struct packet_256 {
     uint32_t index_of_packet;
 };
 
-// Потокобезопасная очередь для любого типа данных (например vector<char>)
+
 template<typename T>
 class SafeQueue {
 private:
@@ -41,7 +41,6 @@ public:
         cv_.notify_one();
     }
 
-    // Возвращает false, если очередь пустая и закончена
     bool pop(T& item) {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&]() { return !queue_.empty() || finished_; });
@@ -65,7 +64,6 @@ public:
 
 
 
-// Класс для замера времени выполнения
 class Measure {
     std::chrono::steady_clock::time_point start_time_;
 
@@ -98,7 +96,6 @@ public:
 
 };
 
-// Буфер для работы с памятью как с потоком
 class MemoryBuffer : public std::streambuf {
 public:
     MemoryBuffer(const char* base, std::size_t size) {
@@ -107,7 +104,7 @@ public:
     }
 };
 
-// Поток ввода из заданного участка памяти
+
 class MemoryInputStream : public std::istream {
 public:
     MemoryInputStream(const char* base, std::size_t size)

@@ -13,13 +13,46 @@
 
 using namespace std;
 
-constexpr uInt CHUNK = packet_256::TOTAL_SIZE - 2;
+constexpr uInt CHUNK = packet_256::DATA_SIZE;
 
-uInt packet_index = 0;
+vector <packet_256> notInOrderBuffer;
+uInt sent_packet_index = 0;
+uInt expected_packet_index = 0;
+
+
+
+static void compressor(z_stream& def_strm, int flush, SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
+{
+    do {
+        def_strm.next_out = reinterpret_cast<Bytef*>(outBuf.data());
+        def_strm.avail_out = CHUNK;
+
+        int ret = deflate(&def_strm, flush);
+        if (ret == Z_STREAM_ERROR) {
+            cerr << "deflate error" << endl;
+            deflateEnd(&def_strm);
+            queue.setFinished();
+            return;
+        }
+
+        uInt have_out = CHUNK - def_strm.avail_out;
+        if (have_out > 0) {
+            Measurement.addCompressedlSize(have_out);
+            vector<char> compressedChunk(outBuf.begin(), outBuf.begin() + have_out);
+
+            packet_256 pkt;
+            uint8_t copy_size = static_cast<uint8_t>(min(compressedChunk.size(), size_t(CHUNK)));
+            copy(compressedChunk.begin(), compressedChunk.begin() + copy_size, pkt.data);
+            pkt.size = copy_size;
+            pkt.index_of_packet = sent_packet_index++;
+            queue.push(move(pkt));
+        }
+    } while (def_strm.avail_out == 0);
+}
 
 
 // --- Модифицированный compressor ---
-void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
+static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
     vector<char> buffer;
     ifstream in(inputFile, ios::binary | std::ios::ate);
     if (!in) {
@@ -62,7 +95,6 @@ void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Mea
         uint8_t copy_size = static_cast<uint8_t>(min(chunk.size(), size_t(CHUNK)));
         copy(chunk.begin(), chunk.begin() + copy_size, pkt.data);
         pkt.size = copy_size;  
-        pkt.index_of_packet = packet_index;
         queue.push(move(pkt));
     }
         queue.setFinished();
@@ -85,39 +117,70 @@ void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Mea
         def_strm.next_in = reinterpret_cast<Bytef*>(inBuf.data());
         def_strm.avail_in = static_cast<uInt>(memStream.gcount());
         Measurement.addOriginalSize(def_strm.avail_in);
-
         flush = memStream.eof() ? Z_FINISH : Z_NO_FLUSH;
 
-        do {
-            def_strm.next_out = reinterpret_cast<Bytef*>(outBuf.data());
-            def_strm.avail_out = CHUNK;
-
-            int ret = deflate(&def_strm, flush);
-            if (ret == Z_STREAM_ERROR) {
-                cerr << "deflate error" << endl;
-                deflateEnd(&def_strm);
-                queue.setFinished();
-                return;
-            }
-
-            uInt have_out = CHUNK - def_strm.avail_out;
-            if (have_out > 0) {
-                Measurement.addCompressedlSize(have_out);
-                vector<char> compressedChunk(outBuf.begin(), outBuf.begin() + have_out);
-
-                packet_256 pkt;
-                uint8_t copy_size = static_cast<uint8_t>(min(compressedChunk.size(), size_t(CHUNK)));
-                copy(compressedChunk.begin(), compressedChunk.begin() + copy_size, pkt.data);
-                pkt.size = copy_size;
-                pkt.index_of_packet = packet_index;
-                queue.push(move(pkt));
-            }
-        } while (def_strm.avail_out == 0);
+        compressor(def_strm, flush, queue, outBuf, Measurement);
 
     } while (flush != Z_FINISH);
 
     deflateEnd(&def_strm);
     queue.setFinished();
+}
+
+
+
+static void decompressor(packet_256& packet, z_stream& strm, vector<char>& outBuf, ofstream& outFile, Measure& Measurement)
+{
+    strm.next_in = reinterpret_cast<Bytef*>(packet.data);
+    strm.avail_in = static_cast<uInt>(packet.size);
+
+    do {
+        strm.next_out = reinterpret_cast<Bytef*>(outBuf.data());
+        strm.avail_out = CHUNK;
+
+        int ret = inflate(&strm, Z_NO_FLUSH);
+        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+            cerr << "inflate error: " << ret << endl;
+            inflateEnd(&strm);
+            return;
+        }
+
+        size_t have_out = CHUNK - strm.avail_out;
+        if (have_out > 0) {
+            outFile.write(outBuf.data(), have_out);
+            if (!outFile) {
+                cerr << "Error writing decompressed data!" << endl;
+                inflateEnd(&strm);
+                return;
+            }
+        }
+
+        if (ret == Z_STREAM_END) {
+            cout << "Полное время от начала сжатия до завершения разжатия: " << Measurement.finishMeasure() << " \n";
+            break;
+        }
+    } while (strm.avail_out == 0);
+}
+
+
+
+static void processPendedPackets(z_stream& strm, vector<char>& outBuf, ofstream& outFile, Measure& Measurement) {
+    bool foundNext;
+    do {
+        foundNext = false;
+        for (auto it = notInOrderBuffer.begin(); it != notInOrderBuffer.end(); ) {
+            if (it->index_of_packet == expected_packet_index) {
+
+                decompressor(*it, strm, outBuf, outFile, Measurement);
+                it = notInOrderBuffer.erase(it);
+                ++expected_packet_index;
+                foundNext = true;
+            }
+            else {
+                ++it;
+            }
+        }
+    } while (foundNext); 
 }
 
 
@@ -153,36 +216,17 @@ void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Me
     packet_256 compressedChunk;
     vector<char> outBuf(CHUNK);
 
-    while (queue.pop(compressedChunk)) {
-        strm.next_in = reinterpret_cast<Bytef*>(compressedChunk.data);
-        strm.avail_in = static_cast<uInt>(compressedChunk.size);
-
-        do {
-            strm.next_out = reinterpret_cast<Bytef*>(outBuf.data());
-            strm.avail_out = CHUNK;
-
-            int ret = inflate(&strm, Z_NO_FLUSH);
-            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
-                cerr << "inflate error: " << ret << endl;
-                inflateEnd(&strm);
-                return;
-            }
-
-            size_t have_out = CHUNK - strm.avail_out;
-            if (have_out > 0) {
-                outFile.write(outBuf.data(), have_out);
-                if (!outFile) {
-                    cerr << "Error writing decompressed data!" << endl;
-                    inflateEnd(&strm);
-                    return;
-                }
-            }
-
-            if (ret == Z_STREAM_END) {
-                cout << "Полное время от начала сжатия до завершения разжатия: " << Measurement.finishMeasure() << " \n";
-                break;
-            }
-        } while (strm.avail_out == 0);
+	while (queue.pop(compressedChunk)) {
+		if (expected_packet_index == compressedChunk.index_of_packet)
+		{
+            decompressor(compressedChunk, strm, outBuf, outFile, Measurement);
+            expected_packet_index++;
+            processPendedPackets(strm, outBuf, outFile, Measurement);
+		}
+        else
+        {
+            notInOrderBuffer.push_back(compressedChunk);
+        }
     }
 
     inflateEnd(&strm);

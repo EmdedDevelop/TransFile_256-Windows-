@@ -17,9 +17,10 @@
 
 struct packet_256 {
     static constexpr size_t TOTAL_SIZE = 256;
-    char data[TOTAL_SIZE - 2];  // минус 2 байта под size (< (TOTAL_SIZE - 2)) и index_of_packet
+    static constexpr size_t DATA_SIZE = TOTAL_SIZE - 5;
+    char data[DATA_SIZE];  // минус 5 байт под size (< (TOTAL_SIZE - 5)) и index_of_packet
     uint8_t size;
-    uint8_t index_of_packet;
+    uint32_t index_of_packet;
 };
 
 // Потокобезопасная очередь для любого типа данных (например vector<char>)

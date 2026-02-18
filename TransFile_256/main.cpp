@@ -22,7 +22,7 @@ mutex mtx;
 bool compressor_busy[2] = {};
 bool data_ready(false);
 condition_variable cvRead, cvCompress;
-bool done = false; // чтобы можно было завершить поток
+bool done = false; 
 
 
 
@@ -67,11 +67,11 @@ static void compress_thread(int compressor_id, MemoryInputStream& memStream, vec
     SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
 {
 
-    std::unique_lock<std::mutex> lock(mtx);
+    unique_lock<mutex> lock(mtx);
 
     while (!done)
     {
-        cvRead.wait(lock, [] { return data_ready || done; }); // ждем события
+        cvRead.wait(lock, [] { return data_ready || done; });
         if (done) break;
 
         data_ready = false;
@@ -79,7 +79,7 @@ static void compress_thread(int compressor_id, MemoryInputStream& memStream, vec
         lock.unlock();
         compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);          
         lock.lock();
-        //std::cout << "Compressor is free again\n";
+        //cout << "Compressor is free again\n";
         compressor_busy[0] = false;
         cvCompress.notify_one();
     }    
@@ -87,10 +87,9 @@ static void compress_thread(int compressor_id, MemoryInputStream& memStream, vec
 
 
 
-// --- Модифицированный compressor ---
 static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
     vector<char> buffer;
-    ifstream in(inputFile, ios::binary | std::ios::ate);
+    ifstream in(inputFile, ios::binary | ios::ate);
     if (!in) {
         cerr << "Failed to open input file!" << endl;
         queue.setFinished();
@@ -99,14 +98,14 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
 
     streamsize size = in.tellg();
     if (size <= 0) {
-        std::cerr << "Файл пустой или ошибка определения размера: " << inputFile << "\n";
+        cerr << "Файл пустой или ошибка определения размера: " << inputFile << endl;
         return;
     }
-    in.seekg(0, std::ios::beg);
+    in.seekg(0, ios::beg);
 
     buffer.resize(size);
     if (!in.read(buffer.data(), size)) {
-        std::cerr << "Ошибка чтения файла: " << inputFile << "\n";
+        cerr << "Ошибка чтения файла: " << inputFile << endl;
         return;
     }
 
@@ -152,19 +151,19 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
 	thread Compressor(compress_thread, thread_id, ref(memStream), ref(inBuf), ref(def_strm), ref(flush), ref(queue), ref(outBuf), ref(Measurement));
 	do {
 		{
-			unique_lock<std::mutex> lock(mtx);
+			unique_lock<mutex> lock(mtx);
 			cvCompress.wait(lock, [] { return (!compressor_busy[0]) && (!data_ready); });
 		}
 		memStream.read(inBuf.data(), CHUNK);
 		{
-			std::lock_guard<std::mutex> lock(mtx);
+			lock_guard<mutex> lock(mtx);
 			data_ready = true;
 		}
 		cvRead.notify_one();
 	} while (flush != Z_FINISH);
 
 	{
-		std::lock_guard<std::mutex> lock(mtx);
+		lock_guard<mutex> lock(mtx);
 		done = true;
 	}
 	cvRead.notify_one();
@@ -232,7 +231,6 @@ static void processPendedPackets(z_stream& strm, vector<char>& outBuf, ofstream&
 }
 
 
-// --- Модифицированный decompressor ---
 void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
     ofstream outFile(outputFile, ios::binary);
     if (!outFile) {
@@ -241,17 +239,17 @@ void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Me
     }
 
     if (!compression) {
-        // Просто читаем блоки из очереди и пишем в файл 
+        // Тупо читаем блоки из очереди и пишем в файл 
         packet_256 chunk;
         while (queue.pop(chunk)) {
             outFile.write(chunk.data, chunk.size);
             if (!outFile) {
-                std::cerr << "Error writing output file!" << std::endl;
+                cerr << "Error writing output file!" << endl;
                 return;
             }
         }
 
-        cout << "Полное время от начала до конца передачи (несжатых данных): " << Measurement.finishMeasure() << "\n";
+        cout << "Полное время от начала до конца передачи (несжатых данных): " << Measurement.finishMeasure() << endl;
         return;
     }
 
@@ -303,7 +301,6 @@ int main(int argc, char* argv[]) {
 
         Measure Measurement;
 
-        // Запускаем компрессор и декомпрессор в отдельных потоках
         thread producer(produce, ref(inputFile), ref(queue), ref(Measurement), compression);
         thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression);
 
@@ -313,7 +310,7 @@ int main(int argc, char* argv[]) {
         if (compression)
         {
             cout << fixed << setprecision(1);
-            cout << "Процент сжатия = " << Measurement.CalculateCompressPercent() << "%" << endl;
+            cout << "Процент сжатия = " << Measurement.CalculateCompressPercent() << "% \n";
         }
 
     }

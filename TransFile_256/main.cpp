@@ -63,7 +63,7 @@ static void compressor(MemoryInputStream& memStream, vector<char>& inBuf, z_stre
 
 
 
-static void compress1(MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
+static void compress_thread(int compressor_id, MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
     SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
 {
 
@@ -76,50 +76,14 @@ static void compress1(MemoryInputStream& memStream, vector<char>& inBuf, z_strea
 
         data_ready = false;
         compressor_busy[0] = true;
-        //cvCompress.notify_all();    
         lock.unlock();
-        //std::cout << "Compress1: data ready, compressing\n";
         compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);          
         lock.lock();
-        //std::cout << "Compress1 is free again\n";
+        //std::cout << "Compressor is free again\n";
         compressor_busy[0] = false;
         cvCompress.notify_one();
     }    
 }
-
-
-static void compress2(MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
-    SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
-{
-
-    std::unique_lock<std::mutex> lock(mtx);
-
-#if 0
-    while (!done)
-    {
-        cvRead.wait(lock, [] { return data_ready || done; }); // ждем события
-        if (done) break;
-
-        data_ready = false;
-        compressor_busy[1] = true;
-        //cvCompress.notify_all();
-        lock.unlock();
-        //std::cout << "Compress1: data ready, compressing\n";
-        compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);
-        lock.lock();
-        //std::cout << "Compress1 is free again\n";
-        compressor_busy[1] = false;
-        cvCompress.notify_one();
-    }
-#endif
-}
-
-
-
-
-
-
-
 
 
 
@@ -184,15 +148,12 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
     }
 
     int flush;
-    std::cout << "Starting compress1\n";
-	thread Compressor1(compress1, ref(memStream), ref(inBuf), ref(def_strm), ref(flush), ref(queue), ref(outBuf), ref(Measurement));
-    std::cout << "Starting compress2\n";
-    thread Compressor2(compress1, ref(memStream), ref(inBuf), ref(def_strm), ref(flush), ref(queue), ref(outBuf), ref(Measurement));
+    int thread_id = 0;
+	thread Compressor(compress_thread, thread_id, ref(memStream), ref(inBuf), ref(def_strm), ref(flush), ref(queue), ref(outBuf), ref(Measurement));
 	do {
 		{
 			unique_lock<std::mutex> lock(mtx);
 			cvCompress.wait(lock, [] { return (!compressor_busy[0]) && (!data_ready); });
-			//std::cout << "Reader: compressor free, reading data\n";
 		}
 		memStream.read(inBuf.data(), CHUNK);
 		{
@@ -200,7 +161,6 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
 			data_ready = true;
 		}
 		cvRead.notify_one();
-		//        compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);
 	} while (flush != Z_FINISH);
 
 	{
@@ -208,8 +168,8 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
 		done = true;
 	}
 	cvRead.notify_one();
-    Compressor1.join();
-    Compressor2.join();
+    Compressor.join();
+
 
     deflateEnd(&def_strm);
     queue.setFinished();

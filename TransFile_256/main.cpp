@@ -18,11 +18,22 @@ constexpr uInt CHUNK = packet_256::DATA_SIZE;
 vector <packet_256> notInOrderBuffer;
 uInt sent_packet_index = 0;
 uInt expected_packet_index = 0;
+mutex mtx;
+bool compressor_busy[2] = {};
+bool data_ready(false);
+condition_variable cvRead, cvCompress;
+bool done = false; // чтобы можно было завершить поток
 
 
 
-static void compressor(z_stream& def_strm, int flush, SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
+static void compressor(MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
+    SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
 {
+    flush = memStream.eof() ? Z_FINISH : Z_NO_FLUSH;
+    def_strm.next_in = reinterpret_cast<Bytef*>(inBuf.data());
+    def_strm.avail_in = static_cast<uInt>(memStream.gcount());
+    Measurement.addOriginalSize(def_strm.avail_in);
+
     do {
         def_strm.next_out = reinterpret_cast<Bytef*>(outBuf.data());
         def_strm.avail_out = CHUNK;
@@ -51,6 +62,67 @@ static void compressor(z_stream& def_strm, int flush, SafeQueue<packet_256>& que
 }
 
 
+
+static void compress1(MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
+    SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
+{
+
+    std::unique_lock<std::mutex> lock(mtx);
+
+    while (!done)
+    {
+        cvRead.wait(lock, [] { return data_ready || done; }); // ждем события
+        if (done) break;
+
+        data_ready = false;
+        compressor_busy[0] = true;
+        //cvCompress.notify_all();    
+        lock.unlock();
+        //std::cout << "Compress1: data ready, compressing\n";
+        compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);          
+        lock.lock();
+        //std::cout << "Compress1 is free again\n";
+        compressor_busy[0] = false;
+        cvCompress.notify_one();
+    }    
+}
+
+
+static void compress2(MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
+    SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
+{
+
+    std::unique_lock<std::mutex> lock(mtx);
+
+#if 0
+    while (!done)
+    {
+        cvRead.wait(lock, [] { return data_ready || done; }); // ждем события
+        if (done) break;
+
+        data_ready = false;
+        compressor_busy[1] = true;
+        //cvCompress.notify_all();
+        lock.unlock();
+        //std::cout << "Compress1: data ready, compressing\n";
+        compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);
+        lock.lock();
+        //std::cout << "Compress1 is free again\n";
+        compressor_busy[1] = false;
+        cvCompress.notify_one();
+    }
+#endif
+}
+
+
+
+
+
+
+
+
+
+
 // --- Модифицированный compressor ---
 static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
     vector<char> buffer;
@@ -61,15 +133,15 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         return;
     }
 
-    streamsize size = in.tellg();  
+    streamsize size = in.tellg();
     if (size <= 0) {
         std::cerr << "Файл пустой или ошибка определения размера: " << inputFile << "\n";
         return;
     }
-    in.seekg(0, std::ios::beg);          
+    in.seekg(0, std::ios::beg);
 
-    buffer.resize(size);                   
-    if (!in.read(buffer.data(), size)) { 
+    buffer.resize(size);
+    if (!in.read(buffer.data(), size)) {
         std::cerr << "Ошибка чтения файла: " << inputFile << "\n";
         return;
     }
@@ -80,23 +152,23 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
 
     if (!compression) {
 
-    while (true) {
-        vector<char> chunk(CHUNK);
+        while (true) {
+            vector<char> chunk(CHUNK);
 
-        memStream.read(chunk.data(), CHUNK);
-        streamsize bytesRead = memStream.gcount();
+            memStream.read(chunk.data(), CHUNK);
+            streamsize bytesRead = memStream.gcount();
 
-        if (bytesRead <= 0)
-            break;
+            if (bytesRead <= 0)
+                break;
        
-        chunk.resize(bytesRead);
+            chunk.resize(bytesRead);
 
-        packet_256 pkt;
-        uint8_t copy_size = static_cast<uint8_t>(min(chunk.size(), size_t(CHUNK)));
-        copy(chunk.begin(), chunk.begin() + copy_size, pkt.data);
-        pkt.size = copy_size;  
-        queue.push(move(pkt));
-    }
+            packet_256 pkt;
+            uint8_t copy_size = static_cast<uint8_t>(min(chunk.size(), size_t(CHUNK)));
+            copy(chunk.begin(), chunk.begin() + copy_size, pkt.data);
+            pkt.size = copy_size;
+            queue.push(move(pkt));
+        }
         queue.setFinished();
         return;
     }
@@ -112,16 +184,32 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
     }
 
     int flush;
-    do {
-        memStream.read(inBuf.data(), CHUNK);
-        def_strm.next_in = reinterpret_cast<Bytef*>(inBuf.data());
-        def_strm.avail_in = static_cast<uInt>(memStream.gcount());
-        Measurement.addOriginalSize(def_strm.avail_in);
-        flush = memStream.eof() ? Z_FINISH : Z_NO_FLUSH;
+    std::cout << "Starting compress1\n";
+	thread Compressor1(compress1, ref(memStream), ref(inBuf), ref(def_strm), ref(flush), ref(queue), ref(outBuf), ref(Measurement));
+    std::cout << "Starting compress2\n";
+    thread Compressor2(compress1, ref(memStream), ref(inBuf), ref(def_strm), ref(flush), ref(queue), ref(outBuf), ref(Measurement));
+	do {
+		{
+			unique_lock<std::mutex> lock(mtx);
+			cvCompress.wait(lock, [] { return (!compressor_busy[0]) && (!data_ready); });
+			//std::cout << "Reader: compressor free, reading data\n";
+		}
+		memStream.read(inBuf.data(), CHUNK);
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			data_ready = true;
+		}
+		cvRead.notify_one();
+		//        compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);
+	} while (flush != Z_FINISH);
 
-        compressor(def_strm, flush, queue, outBuf, Measurement);
-
-    } while (flush != Z_FINISH);
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		done = true;
+	}
+	cvRead.notify_one();
+    Compressor1.join();
+    Compressor2.join();
 
     deflateEnd(&def_strm);
     queue.setFinished();
@@ -145,7 +233,7 @@ static void decompressor(packet_256& packet, z_stream& strm, vector<char>& outBu
             return;
         }
 
-        size_t have_out = CHUNK - strm.avail_out;
+        uint8_t have_out = CHUNK - strm.avail_out;
         if (have_out > 0) {
             outFile.write(outBuf.data(), have_out);
             if (!outFile) {

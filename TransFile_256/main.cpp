@@ -13,7 +13,7 @@
 
 using namespace std;
 
-constexpr size_t CHUNK = packet_256::TOTAL_SIZE - 2;
+constexpr uInt CHUNK = packet_256::TOTAL_SIZE - 2;
 
 uInt packet_index = 0;
 
@@ -59,9 +59,9 @@ void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Mea
         chunk.resize(bytesRead);
 
         packet_256 pkt;
-        size_t copy_size = min(chunk.size(), size_t(CHUNK));
-        std::copy(chunk.begin(), chunk.begin() + copy_size, pkt.data);
-        pkt.size = static_cast<uint8_t>(copy_size);  
+        uint8_t copy_size = static_cast<uint8_t>(min(chunk.size(), size_t(CHUNK)));
+        copy(chunk.begin(), chunk.begin() + copy_size, pkt.data);
+        pkt.size = copy_size;  
         pkt.index_of_packet = packet_index;
         queue.push(move(pkt));
     }

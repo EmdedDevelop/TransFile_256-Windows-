@@ -1,8 +1,8 @@
-/x64/
-/x64_windows/
-/TransFile_256/x64/
+x64/
+x64_windows/
+TransFile_256/x64/
 TransFile_256.slnx
-/TransFile_256/*.bin
-/TransFile_256/*.user
-/TransFile_256/*.vcxproj
-/TransFile_256/*.vcxproj.filters
+TransFile_256/*.bin
+TransFile_256/*.user
+TransFile_256/*.vcxproj
+TransFile_256/*.vcxproj.filters

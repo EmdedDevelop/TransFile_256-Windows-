@@ -16,8 +16,6 @@ using namespace std;
 constexpr uInt CHUNK = packet_256::DATA_SIZE;
 
 vector <packet_256> notInOrderBuffer;
-uInt sent_packet_index = 0;
-uInt expected_packet_index = 0;
 mutex mtx;
 bool compressor_busy[2] = {};
 bool data_ready(false);
@@ -26,7 +24,17 @@ bool done = false;
 
 
 
-static void compressor(MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
+// Считали пол-файла - запустили свой объект для компрессора 1, в нём помечаем что это первый компрессор
+// Считали вторую половину файла - запустили другой объект для компрессора 2, в нём помечаем, что это второй
+
+// На приёме - запустили сразу два потока декомпрессора. Первый обрабатывает только пакеты с признаком первого
+// Второй - только пакеты с признаком второго
+
+// Первый поток сразу пишет в файл, второй поток пишет в память, а как только закончит
+// проверяет, что первый поток записал файл и после этого пишет вторую часть
+
+
+static void compressor(int compressor_id, MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
     SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
 {
     flush = memStream.eof() ? Z_FINISH : Z_NO_FLUSH;
@@ -55,7 +63,7 @@ static void compressor(MemoryInputStream& memStream, vector<char>& inBuf, z_stre
             uint8_t copy_size = static_cast<uint8_t>(min(compressedChunk.size(), size_t(CHUNK)));
             copy(compressedChunk.begin(), compressedChunk.begin() + copy_size, pkt.data);
             pkt.size = copy_size;
-            pkt.index_of_packet = sent_packet_index++;
+            pkt.compressor_id = compressor_id;
             queue.push(move(pkt));
         }
     } while (def_strm.avail_out == 0);
@@ -63,10 +71,20 @@ static void compressor(MemoryInputStream& memStream, vector<char>& inBuf, z_stre
 
 
 
-static void compress_thread(int compressor_id, MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
+static void compress_thread(int compressor_id, MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm,
     SafeQueue<packet_256>& queue, vector<char>& outBuf, Measure& Measurement)
 {
 
+    int flush;
+    do {
+        memStream.read(inBuf.data(), CHUNK);
+        compressor(compressor_id, memStream, inBuf, def_strm, ref(flush),
+            queue, outBuf, Measurement);
+    } while (flush != Z_FINISH);
+
+
+
+#if 0
     unique_lock<mutex> lock(mtx);
 
     while (!done)
@@ -83,12 +101,14 @@ static void compress_thread(int compressor_id, MemoryInputStream& memStream, vec
         compressor_busy[0] = false;
         cvCompress.notify_one();
     }    
+#endif
 }
 
 
 
 static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
-    vector<char> buffer;
+    constexpr uint8_t totalParts = 1;
+
     ifstream in(inputFile, ios::binary | ios::ate);
     if (!in) {
         cerr << "Failed to open input file!" << endl;
@@ -96,23 +116,55 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         return;
     }
 
-    streamsize size = in.tellg();
+    vector<vector<char>> buffers;
+    vector<thread> compressors;
+
+    streamsize size = in.tellg() / totalParts;
     if (size <= 0) {
         cerr << "Файл пустой или ошибка определения размера: " << inputFile << endl;
         return;
     }
     in.seekg(0, ios::beg);
-
-    buffer.resize(size);
-    if (!in.read(buffer.data(), size)) {
-        cerr << "Ошибка чтения файла: " << inputFile << endl;
-        return;
-    }
-
-    MemoryInputStream memStream(buffer.data(), buffer.size());
+    buffers.resize(totalParts, vector<char>(size));
+    z_stream def_strm[totalParts]{};
+    //int flush[totalParts];
+        
+    vector<vector<char>> inBuf(totalParts, vector<char>(CHUNK));
+    vector<vector<char>> outBuf(totalParts, vector<char>(CHUNK));
+    vector<unique_ptr<MemoryInputStream>> memStream;
+    memStream.reserve(totalParts); 
 
     Measurement.startMeasure();
 
+    for (uint8_t portionNumber = 0; portionNumber < totalParts; portionNumber++)
+    {
+
+        if (!in.read(buffers[portionNumber].data(), size)) {
+            cerr << "Ошибка чтения файла: " << inputFile << endl;
+            return;
+        }
+
+        memStream.emplace_back(make_unique<MemoryInputStream>(buffers[portionNumber].data(), 
+        buffers[portionNumber].size()));
+
+        if (deflateInit(&def_strm[portionNumber], 4) != Z_OK) {
+            cerr << "deflateInit failed!" << endl;
+            queue.setFinished();
+            return;
+        }
+
+        compressors.emplace_back(compress_thread, portionNumber, ref(*memStream[portionNumber]), ref(inBuf[portionNumber]),
+            ref(def_strm[portionNumber]), ref(queue), ref(outBuf[portionNumber]), std::ref(Measurement));
+    }      
+
+
+    for (auto& t : compressors) {
+        if (t.joinable())
+            t.join();
+    }
+    
+
+#if 0
     if (!compression) {
 
         while (true) {
@@ -135,7 +187,9 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         queue.setFinished();
         return;
     }
+#endif
 
+#if 0
     vector<char> inBuf(CHUNK);
     vector<char> outBuf(CHUNK);
 
@@ -171,6 +225,9 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
 
 
     deflateEnd(&def_strm);
+
+#endif
+
     queue.setFinished();
 }
 
@@ -210,26 +267,27 @@ static void decompressor(packet_256& packet, z_stream& strm, vector<char>& outBu
 }
 
 
-
+#if 0
 static void processPendedPackets(z_stream& strm, vector<char>& outBuf, ofstream& outFile, Measure& Measurement) {
     bool foundNext;
     do {
         foundNext = false;
         for (auto it = notInOrderBuffer.begin(); it != notInOrderBuffer.end(); ) {
-            if (it->index_of_packet == expected_packet_index) {
+            //if (it->index_of_packet == expected_packet_index) {
 
                 decompressor(*it, strm, outBuf, outFile, Measurement);
                 it = notInOrderBuffer.erase(it);
-                ++expected_packet_index;
+                //++expected_packet_index;
                 foundNext = true;
-            }
-            else {
-                ++it;
-            }
+            //}
+            //else {
+            //    ++it;
+            //}
         }
     } while (foundNext); 
 }
 
+#endif
 
 void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
     ofstream outFile(outputFile, ios::binary);
@@ -263,16 +321,16 @@ void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Me
     vector<char> outBuf(CHUNK);
 
 	while (queue.pop(compressedChunk)) {
-		if (expected_packet_index == compressedChunk.index_of_packet)
-		{
+		//if (expected_packet_index == compressedChunk.index_of_packet)
+		//{
             decompressor(compressedChunk, strm, outBuf, outFile, Measurement);
-            expected_packet_index++;
-            processPendedPackets(strm, outBuf, outFile, Measurement);
-		}
-        else
-        {
-            notInOrderBuffer.push_back(compressedChunk);
-        }
+            //expected_packet_index++;
+            //processPendedPackets(strm, outBuf, outFile, Measurement);
+		//}
+        //else
+        //{
+        //    notInOrderBuffer.push_back(compressedChunk);
+       // }
     }
 
     inflateEnd(&strm);

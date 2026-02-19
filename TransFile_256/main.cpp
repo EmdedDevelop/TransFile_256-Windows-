@@ -8,30 +8,24 @@
 #include <condition_variable>
 #include <zlib.h>
 #include <iomanip>
+#include <future>
 #include "main.h"
 
 
 using namespace std;
 
 constexpr uInt CHUNK = packet_256::DATA_SIZE;
+constexpr uint8_t totalParts = 1; // пока жёстко тут, но позже должно вычисляться в runtime
 
-vector <packet_256> notInOrderBuffer;
-mutex mtx;
-bool compressor_busy[2] = {};
-bool data_ready(false);
-condition_variable cvRead, cvCompress;
+//vector <packet_256> notInOrderBuffer;
+//mutex mtx;
+bool decompressor_busy[totalParts] = {};
+//bool data_ready(false);
+//condition_variable cvRead,cvDecompress;
 bool done = false; 
 
+vector<DecompressorData> decompressorQueues(totalParts);
 
-
-// Считали пол-файла - запустили свой объект для компрессора 1, в нём помечаем что это первый компрессор
-// Считали вторую половину файла - запустили другой объект для компрессора 2, в нём помечаем, что это второй
-
-// На приёме - запустили сразу два потока декомпрессора. Первый обрабатывает только пакеты с признаком первого
-// Второй - только пакеты с признаком второго
-
-// Первый поток сразу пишет в файл, второй поток пишет в память, а как только закончит
-// проверяет, что первый поток записал файл и после этого пишет вторую часть
 
 
 static void compressor(int compressor_id, MemoryInputStream& memStream, vector<char>& inBuf, z_stream& def_strm, int& flush,
@@ -81,33 +75,11 @@ static void compress_thread(int compressor_id, MemoryInputStream& memStream, vec
         compressor(compressor_id, memStream, inBuf, def_strm, ref(flush),
             queue, outBuf, Measurement);
     } while (flush != Z_FINISH);
-
-
-
-#if 0
-    unique_lock<mutex> lock(mtx);
-
-    while (!done)
-    {
-        cvRead.wait(lock, [] { return data_ready || done; });
-        if (done) break;
-
-        data_ready = false;
-        compressor_busy[0] = true;
-        lock.unlock();
-        compressor(memStream, inBuf, def_strm, flush, queue, outBuf, Measurement);          
-        lock.lock();
-        //cout << "Compressor is free again\n";
-        compressor_busy[0] = false;
-        cvCompress.notify_one();
-    }    
-#endif
 }
 
 
 
-static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
-    constexpr uint8_t totalParts = 1;
+static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression, promise<streamsize> sizePromise) {
 
     ifstream in(inputFile, ios::binary | ios::ate);
     if (!in) {
@@ -124,11 +96,12 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         cerr << "Файл пустой или ошибка определения размера: " << inputFile << endl;
         return;
     }
+    sizePromise.set_value(size);
     in.seekg(0, ios::beg);
     buffers.resize(totalParts, vector<char>(size));
-    z_stream def_strm[totalParts]{};
-    //int flush[totalParts];
-        
+
+
+    z_stream def_strm[totalParts]{};        
     vector<vector<char>> inBuf(totalParts, vector<char>(CHUNK));
     vector<vector<char>> outBuf(totalParts, vector<char>(CHUNK));
     vector<unique_ptr<MemoryInputStream>> memStream;
@@ -189,52 +162,14 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
     }
 #endif
 
-#if 0
-    vector<char> inBuf(CHUNK);
-    vector<char> outBuf(CHUNK);
-
-    z_stream def_strm{};
-    if (deflateInit(&def_strm, 4) != Z_OK) {
-        cerr << "deflateInit failed!" << endl;
-        queue.setFinished();
-        return;
-    }
-
-    int flush;
-    int thread_id = 0;
-	thread Compressor(compress_thread, thread_id, ref(memStream), ref(inBuf), ref(def_strm), ref(flush), ref(queue), ref(outBuf), ref(Measurement));
-	do {
-		{
-			unique_lock<mutex> lock(mtx);
-			cvCompress.wait(lock, [] { return (!compressor_busy[0]) && (!data_ready); });
-		}
-		memStream.read(inBuf.data(), CHUNK);
-		{
-			lock_guard<mutex> lock(mtx);
-			data_ready = true;
-		}
-		cvRead.notify_one();
-	} while (flush != Z_FINISH);
-
-	{
-		lock_guard<mutex> lock(mtx);
-		done = true;
-	}
-	cvRead.notify_one();
-    Compressor.join();
-
-
-    deflateEnd(&def_strm);
-
-#endif
-
     queue.setFinished();
 }
 
 
 
-static void decompressor(packet_256& packet, z_stream& strm, vector<char>& outBuf, ofstream& outFile, Measure& Measurement)
+static void decompress(packet_256& packet, z_stream& strm, vector<char>& outBuf, ofstream& outFile, Measure& Measurement)
 {
+
     strm.next_in = reinterpret_cast<Bytef*>(packet.data);
     strm.avail_in = static_cast<uInt>(packet.size);
 
@@ -264,32 +199,35 @@ static void decompressor(packet_256& packet, z_stream& strm, vector<char>& outBu
             break;
         }
     } while (strm.avail_out == 0);
+
 }
 
 
-#if 0
-static void processPendedPackets(z_stream& strm, vector<char>& outBuf, ofstream& outFile, Measure& Measurement) {
-    bool foundNext;
-    do {
-        foundNext = false;
-        for (auto it = notInOrderBuffer.begin(); it != notInOrderBuffer.end(); ) {
-            //if (it->index_of_packet == expected_packet_index) {
 
-                decompressor(*it, strm, outBuf, outFile, Measurement);
-                it = notInOrderBuffer.erase(it);
-                //++expected_packet_index;
-                foundNext = true;
-            //}
-            //else {
-            //    ++it;
-            //}
-        }
-    } while (foundNext); 
+static void decompress_thread(int decompressor_id, z_stream& strm, vector<char>& outBuf, ofstream& outFile, Measure& Measurement)
+{
+
+    auto& data = decompressorQueues[decompressor_id];
+    //unique_lock<mutex> lock(mtx);    
+
+    while (!done)
+    {
+        std::unique_lock<std::mutex> lock(data.mtx);
+        data.cv.wait(lock, [&] { return !data.packetQueue.empty() || done; });
+
+        if (done) break;
+
+        packet_256 packet = data.packetQueue.front();
+        data.packetQueue.pop();
+        lock.unlock();
+
+        decompress(packet, strm, outBuf, outFile, Measurement);
+    }
+
 }
 
-#endif
 
-void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression) {
+void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression, streamsize size) {
     ofstream outFile(outputFile, ios::binary);
     if (!outFile) {
         cerr << "Failed to open output file!" << endl;
@@ -319,18 +257,54 @@ void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Me
         
     packet_256 compressedChunk;
     vector<char> outBuf(CHUNK);
+    vector<thread>decompressors;
+    vector<unique_ptr<MemoryOutputStream>> memStream;
+    memStream.reserve(totalParts);
 
-	while (queue.pop(compressedChunk)) {
-		//if (expected_packet_index == compressedChunk.index_of_packet)
-		//{
-            decompressor(compressedChunk, strm, outBuf, outFile, Measurement);
-            //expected_packet_index++;
-            //processPendedPackets(strm, outBuf, outFile, Measurement);
-		//}
-        //else
-        //{
-        //    notInOrderBuffer.push_back(compressedChunk);
-       // }
+    uInt partSize = static_cast<uInt>(size / totalParts);
+
+    vector<vector<char>> buffers(totalParts, vector<char>(partSize));
+
+    // запустить оба потока декомпрессора
+    // decompress.wait(decompressor_busy && !data_ready)
+    // data_ready = true
+    // cv.notify()
+    // unlock
+    
+
+    // внутри потока cv.wait (compressedChunk.compressor_id == decompressor_id)
+    // по выходу 
+    // обнуляем data_Ready
+    // decompresorBusy = true;
+    // unlock
+    // запускаем decompressor()
+    // внутри decompressor пишем данные в память
+    // как только компрессор закончил работу, переписываем данные из ОЗУ и файл
+    // причём 0 пишет сразу, 1-ый ждёт нулевого (data_written[decompressor_id] == true)
+    // После записи выходим из потока (break)
+    // lock
+    // decompresorBusy = false;
+
+    for (uint8_t portionNumber = 0; portionNumber < totalParts; portionNumber++)
+    {
+        decompressors.emplace_back(decompress_thread, portionNumber, ref(strm), ref(outBuf), ref(outFile), ref(Measurement));
+    }
+
+    while (queue.pop(compressedChunk))
+    {
+        uint8_t id = compressedChunk.compressor_id;
+        {
+            std::lock_guard<std::mutex> lock(decompressorQueues[id].mtx);
+            decompressorQueues[id].packetQueue.push(compressedChunk);
+        }
+        decompressorQueues[id].cv.notify_one();
+    }
+
+    done = true;   
+
+    for (auto& t : decompressors) {
+        if (t.joinable())
+            t.join();
     }
 
     inflateEnd(&strm);
@@ -356,11 +330,16 @@ int main(int argc, char* argv[]) {
         bool compression = (stoi(argv[3]) != 0) ? true : false;
 
         SafeQueue<packet_256> queue;
+        std::promise<streamsize> sizePromise;
+        std::future<streamsize> sizeFuture = sizePromise.get_future();
 
         Measure Measurement;
 
-        thread producer(produce, ref(inputFile), ref(queue), ref(Measurement), compression);
-        thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression);
+        thread producer(produce, ref(inputFile), ref(queue), ref(Measurement), compression, move(sizePromise));
+
+        streamsize OriginalSize = sizeFuture.get();
+
+        thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression, OriginalSize);
 
         producer.join();
         consumer.join();
@@ -374,3 +353,20 @@ int main(int argc, char* argv[]) {
     }
     return 0;
 }
+
+
+
+
+#if 0
+for (size_t i = 0; i < totalParts; ++i) {
+    // Создаем поток с "оберткой" над буфером buffers[i]
+    memStream.emplace_back(std::make_unique<MemoryOutputStream>(buffers[i].data(), buffers[i].size()));
+
+    // Пишем данные в поток, они попадут в buffers[i]
+    (*memStream.back()) << "Data part #" << i << " written here.\n";
+
+    // Или напрямую методом write (если нужно писать бинарно)
+    // const char* rawData = ...;
+    // memStream.back()->write(rawData, rawDataSize);
+}
+#endif

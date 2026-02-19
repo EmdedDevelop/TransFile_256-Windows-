@@ -24,6 +24,13 @@ struct packet_256 {
 };
 
 
+struct DecompressorData {
+    std::queue<packet_256> packetQueue;
+    std::mutex mtx;
+    std::condition_variable cv;
+};
+
+
 template<typename T>
 class SafeQueue {
 private:
@@ -114,5 +121,18 @@ public:
 private:
     MemoryBuffer buffer_;
 };
+
+
+class MemoryOutputStream : public std::ostream {
+public:
+    MemoryOutputStream(const char* base, std::size_t size)
+        : std::ostream(&buffer_), buffer_(base, size) {
+    }
+
+private:
+    MemoryBuffer buffer_;
+};
+
+
 
 #endif // MAIN_H

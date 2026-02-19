@@ -103,9 +103,9 @@ public:
 
 };
 
-class MemoryBuffer : public std::streambuf {
+class MemoryInBuffer : public std::streambuf {
 public:
-    MemoryBuffer(const char* base, std::size_t size) {
+    MemoryInBuffer(const char* base, std::size_t size) {
         char* p = const_cast<char*>(base);
         this->setg(p, p, p + size);
     }
@@ -119,18 +119,37 @@ public:
     }
 
 private:
-    MemoryBuffer buffer_;
+    MemoryInBuffer buffer_;
 };
+
+
+
+class MemoryOutBuffer : public std::streambuf {
+public:
+    MemoryOutBuffer(char* base, std::size_t size) {
+        setp(base, base + size);
+    }
+
+    // Получить указатель на начало буфера записи:
+    char* data() const { return pbase(); }
+
+    // Получить сколько байт записано:
+    std::size_t size() const { return static_cast<size_t>(pptr() - pbase()); }
+};
+
 
 
 class MemoryOutputStream : public std::ostream {
 public:
-    MemoryOutputStream(const char* base, std::size_t size)
+    MemoryOutputStream(char* base, std::size_t size)
         : std::ostream(&buffer_), buffer_(base, size) {
     }
 
+   char* data() const { return buffer_.data(); }
+   std::size_t size() const { return buffer_.size(); }
+
 private:
-    MemoryBuffer buffer_;
+    MemoryOutBuffer buffer_;
 };
 
 

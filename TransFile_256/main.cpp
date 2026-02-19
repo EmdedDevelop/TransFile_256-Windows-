@@ -16,11 +16,10 @@
 using namespace std;
 
 constexpr uInt CHUNK = packet_256::DATA_SIZE;
-constexpr uint8_t totalParts = 1; // пока жёстко тут, но позже должно вычисляться в runtime
+constexpr uint8_t totalParts = 2; // пока жёстко тут, но позже должно вычисляться в runtime
 bool decompressor_busy[totalParts] = {};
 bool done = false; 
 vector<DecompressorData> decompressorQueues(totalParts);
-
 
 
 
@@ -227,7 +226,7 @@ static void decompress_thread(int decompressor_id, z_stream& strm, MemoryOutputS
 }
 
 
-static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression, streamsize size) {
+static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression, streamsize partSize) {
     ofstream outFile(outputFile, ios::binary);
     if (!outFile) {
         cerr << "Failed to open output file!" << endl;
@@ -255,8 +254,6 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
     vector<unique_ptr<MemoryOutputStream>> memStream;
     memStream.reserve(totalParts);
 
-    uInt partSize = static_cast<uInt>(size / totalParts);
-
     vector<vector<char>> buffers(totalParts, vector<char>(partSize));
 
     z_stream strm[totalParts]{};
@@ -274,12 +271,12 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
 
     while (queue.pop(compressedChunk))
     {
-        uint8_t id = compressedChunk.compressor_id;
+        uint8_t compress_id = compressedChunk.compressor_id;
         {
-            lock_guard<mutex> lock(decompressorQueues[id].mtx);
-            decompressorQueues[id].packetQueue.push(compressedChunk);
+            lock_guard<mutex> lock(decompressorQueues[compress_id].mtx);
+            decompressorQueues[compress_id].packetQueue.push(compressedChunk);
         }
-        decompressorQueues[id].cv.notify_one();
+        decompressorQueues[compress_id].cv.notify_one();
     }
 
 	done = true;
@@ -299,8 +296,12 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
 
     for (uint8_t id = 0; id < totalParts; id++)
     {
+        //cout << "size of ID#" << static_cast<uInt>(id) << " = " << memStream[id]->size() << endl;
+        //cout << "Total ID#" << static_cast<uInt>(id) << " = " << total[id] << endl;
         outFile.write(memStream[id]->data(), memStream[id]->size());
     }
+
+    
         
     outFile.close();
 }
@@ -325,16 +326,16 @@ int main(int argc, char* argv[]) {
         bool compression = (stoi(argv[3]) != 0) ? true : false;
 
         SafeQueue<packet_256> queue;
-        std::promise<streamsize> sizePromise;
-        std::future<streamsize> sizeFuture = sizePromise.get_future();
+        promise<streamsize> sizePromise;
+        future<streamsize> sizeFuture = sizePromise.get_future();
 
         Measure Measurement;
 
         thread producer(produce, ref(inputFile), ref(queue), ref(Measurement), compression, move(sizePromise));
 
-        streamsize OriginalSize = sizeFuture.get();
+        streamsize partSize = sizeFuture.get();
 
-        thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression, OriginalSize);
+        thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression, partSize);
 
         producer.join();
         consumer.join();

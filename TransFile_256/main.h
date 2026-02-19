@@ -30,6 +30,13 @@ struct DecompressorData {
     std::condition_variable cv;
 };
 
+struct parts_and_size {
+    uInt partSize;
+    uInt residue;
+    uint8_t ThreadsNum;
+};
+
+
 
 template<typename T>
 class SafeQueue {
@@ -65,7 +72,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             finished_ = true;
         }
-        cv_.notify_one();
+        cv_.notify_all();
     }
 };
 

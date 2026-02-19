@@ -369,10 +369,11 @@ int main(int argc, char* argv[]) {
     {
         string inputFile = argv[1];
         string outputFile = argv[2];
-        bool compression = (stoi(argv[3]) != 0) ? true : false;
+        int compressionMode = atoi(argv[3]);
+        bool compression = (compressionMode == 1);
 
-        SafeQueue<packet_256> queue;
         promise<parts_and_size> sizePromise;
+        SafeQueue<packet_256> queue;
         future<parts_and_size> sizeFuture = sizePromise.get_future();
         uint8_t ThreadsNum = WishThreads;
 
@@ -383,13 +384,18 @@ int main(int argc, char* argv[]) {
         if (compression)
         {
             parts_and_size parts_size = sizeFuture.get();
+            vector<DecompressorData> decompressorQueues(parts_size.ThreadsNum);
+            thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression, parts_size, ref(decompressorQueues));
+            producer.join();
+            consumer.join();
         }  
-        vector<DecompressorData> decompressorQueues(parts_size.ThreadsNum);
-
-        thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression, parts_size, ref(decompressorQueues));
-
-        producer.join();
-        consumer.join();
+        else
+        {
+            vector<DecompressorData> dummy; // пустые данные не нужны
+            thread consumer(consume, outputFile, ref(queue), ref(Measurement), compression, parts_size, ref(dummy));
+            producer.join();
+            consumer.join();
+        }       
 
         if (compression)
         {

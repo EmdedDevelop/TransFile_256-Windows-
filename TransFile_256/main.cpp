@@ -82,6 +82,40 @@ static void compress_thread(int compressor_id, MemoryInputStream& memStream, z_s
 }
 
 
+static void SimplyCopier(istream& in, const string& inputFile, SafeQueue<packet_256>& queue, const streamsize origSize)
+{
+    vector <char> buffer(origSize);
+
+    if (!in.read(buffer.data(), origSize)) { // считать данные в буфер
+        std::cerr << "Ошибка чтения файла: " << inputFile << "\n";
+        return;
+    }
+
+    MemoryInputStream memStream(buffer.data(), buffer.size());
+    vector<char> chunk(CHUNK);
+
+    while (true) {
+
+        memStream.read(chunk.data(), CHUNK);
+        streamsize bytesRead = memStream.gcount();
+        //            in.read(chunk.data(), CHUNK);
+        //            streamsize bytesRead = in.gcount();
+
+        if (bytesRead <= 0)
+            break;
+
+        chunk.resize(bytesRead);
+
+        packet_256 pkt;
+        uint8_t copy_size = static_cast<uint8_t>(min(chunk.size(), size_t(CHUNK)));
+        copy(chunk.begin(), chunk.begin() + copy_size, pkt.data);
+        pkt.size = copy_size;
+        queue.push(move(pkt));
+    }
+    queue.setFinished();
+}
+
+
 
 static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression, promise<parts_and_size> sizePromise, uint8_t ThreadsNum) {
 
@@ -92,9 +126,6 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         return;
     }
 
-    vector<vector<char>> buffers;
-    vector<thread> compressors;
-
     streamsize origSize = in.tellg();
 
     if (origSize <= 0) {
@@ -103,38 +134,16 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
     }
 
     in.seekg(0, ios::beg);
-
-
+    
     if (!compression) {
         Measurement.startMeasure();
-        while (true) {
-            vector<char> chunk(CHUNK);
-
-            in.read(chunk.data(), CHUNK);
-            streamsize bytesRead = in.gcount();
-
-            if ((bytesRead == 0) || in.eof())
-                break;
-
-            if (in.fail() && !in.eof()) {
-                cerr << "Ошибка чтения файла: " << inputFile << endl;
-                return;
-            }
-
-            chunk.resize(bytesRead);
-
-            packet_256 pkt;
-            uint8_t copy_size = static_cast<uint8_t>(min(chunk.size(), size_t(CHUNK)));
-            copy(chunk.begin(), chunk.begin() + copy_size, pkt.data);
-            pkt.size = copy_size;
-            queue.push(move(pkt));
-        }
-        in.close();
-        queue.setFinished();
+        SimplyCopier(in, inputFile, queue, origSize);
         return;
     }
 
 
+    vector<vector<char>> buffers;
+    vector<thread> compressors;
     uInt portion_size = static_cast<uInt>(origSize / ThreadsNum);
     uint8_t residue = origSize % ThreadsNum;
     parts_size.ThreadsNum = (residue == 0) ? ThreadsNum : (ThreadsNum + 1);
@@ -153,14 +162,11 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
 
     for (uint8_t portionNumber = 0; portionNumber < parts_size.ThreadsNum; portionNumber++)
     {
-        streamsize size;
-        if (portionNumber != (parts_size.ThreadsNum - 1))
+        size_t size = parts_size.partSize;
+
+        if (portionNumber == (parts_size.ThreadsNum - 1))
         {
-            size = parts_size.partSize;
-        }
-        else
-        {
-            size = parts_size.residue;
+             size = parts_size.residue;
         }
 
         if (!in.read(buffers[portionNumber].data(), size)) {
@@ -168,17 +174,8 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
             return;
         }
 
-        size_t mem_size = buffers[portionNumber].size();
-
-        if (portionNumber == (parts_size.ThreadsNum - 1))
-        {
-            if (parts_size.residue != parts_size.partSize)
-            {
-                mem_size = parts_size.residue;
-            }
-        }
         memStream.emplace_back(make_unique<MemoryInputStream>(buffers[portionNumber].data(),
-            mem_size));
+            size));
 
         if (deflateInit(&def_strm[portionNumber], 4) != Z_OK) {
             cerr << "deflateInit failed!" << endl;
@@ -197,12 +194,6 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         if (t.joinable())
             t.join();
     }
-    
-
-#if 0
-
-#endif
-
     queue.setFinished();
 }
 
@@ -237,12 +228,16 @@ static void decompress(packet_256& packet, z_stream& strm, vector<char>& outBuf,
 }
 
 
-
-static void decompress_thread(int decompressor_id, z_stream& strm, MemoryOutputStream& memOutStream, vector<DecompressorData>& decompressorQueues)
+static void decompress_thread(int decompressor_id, MemoryOutputStream& memOutStream, vector<DecompressorData>& decompressorQueues)
 {
 
     auto& data = decompressorQueues[decompressor_id];
     vector<char> outBuf(CHUNK);
+    z_stream strm{};
+    if (inflateInit(&strm) != Z_OK) {
+        cerr << "inflateInit failed!" << endl;
+        return;
+    }
 
     while (!done)
     {
@@ -262,29 +257,34 @@ static void decompress_thread(int decompressor_id, z_stream& strm, MemoryOutputS
 }
 
 
+static void SimplyPaster(SafeQueue<packet_256>& queue, ofstream& outFile)
+{
+    // Тупо читаем блоки из очереди и пишем в файл 
+    packet_256 chunk;
+    while (queue.pop(chunk)) {
+        outFile.write(chunk.data, chunk.size);
+        if (!outFile) {
+            cerr << "Error writing output file!" << endl;
+            return;
+        }
+    }
+}
+
+
 static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Measure& Measurement, bool compression, 
     parts_and_size partsAndSize, vector<DecompressorData>& decompressorQueues) {
     ofstream outFile(outputFile, ios::binary);
     if (!outFile) {
         cerr << "Failed to open output file!" << endl;
-        return;
+        return;    
     }
 
-    if (!compression) {
-        // Тупо читаем блоки из очереди и пишем в файл 
-        packet_256 chunk;
-        while (queue.pop(chunk)) {
-            outFile.write(chunk.data, chunk.size);
-            if (!outFile) {
-                cerr << "Error writing output file!" << endl;
-                return;
-            }
-        }
 
+    if (!compression) {
+        SimplyPaster(queue, outFile);
         cout << "Полное время от начала до конца передачи (несжатых данных): " << Measurement.finishMeasure() << endl;
         return;
     }
-
         
     packet_256 compressedChunk;
     vector<thread>decompressors;
@@ -293,25 +293,26 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
 
     vector<vector<char>> buffers(partsAndSize.ThreadsNum, vector<char>(partsAndSize.partSize));
 
-    vector <z_stream> strm(partsAndSize.ThreadsNum);
-
     for (uint8_t portionNumber = 0; portionNumber < partsAndSize.ThreadsNum; portionNumber++)
     {  
-        if (inflateInit(&strm[portionNumber]) != Z_OK) {
-            cerr << "inflateInit failed!" << endl;
-            return;
-        }
+
         memStream.emplace_back(make_unique<MemoryOutputStream>(buffers[portionNumber].data(), partsAndSize.partSize));
 
-        decompressors.emplace_back(decompress_thread, portionNumber, ref(strm[portionNumber]), ref(*memStream[portionNumber]), ref(decompressorQueues));
+        decompressors.emplace_back(decompress_thread, portionNumber, ref(*memStream[portionNumber]), ref(decompressorQueues));
     }
 
     while (queue.pop(compressedChunk))
     {
         uint8_t compress_id = compressedChunk.compressor_id;
+        const uint8_t dataSize = CHUNK;
+        bool allZero = all_of(compressedChunk.data, compressedChunk.data + dataSize, [](char c) { return c == 0; });
+        if (allZero)
+        {
+            cout << "Received Zeroed chunk \n";
+        }
         {
             lock_guard<mutex> lock(decompressorQueues[compress_id].mtx);
-            decompressorQueues[compress_id].packetQueue.push(compressedChunk);
+            decompressorQueues[compress_id].packetQueue.push(move(compressedChunk));
         }
         decompressorQueues[compress_id].cv.notify_one();
     }
@@ -331,25 +332,97 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
 
     cout << "Полное время от начала сжатия до завершения разжатия: " << Measurement.finishMeasure() << " \n";
 
+    uInt memSize = parts_size.partSize;
     for (uint8_t id = 0; id < partsAndSize.ThreadsNum; id++)
     {
-        if (id != partsAndSize.ThreadsNum - 1)
+        if (Measurement.containsNZeros(buffers[id], 20000))
         {
-            outFile.write(memStream[id]->data(), memStream[id]->size());
+            cout << "Achtung! More than 20000 bytes are zero in buffers[" << static_cast<uInt>(id) << "] \n";
         }
-        else
+
+        if (id == partsAndSize.ThreadsNum - 1)
+        { 
+            memSize = parts_size.residue;
+        }
+
+        outFile.write(reinterpret_cast<const char*>(memStream[id]->data()), memSize);
+
+        // Проверка ошибок записи
+        if (!outFile)
         {
-            outFile.write(memStream[id]->data(), parts_size.residue);
+            std::cerr << "Error writing decompressed data!" << std::endl;
+            return;
         }
-        if (!outFile) {
-            cerr << "Error writing decompressed data!" << endl;
+
+        outFile.flush();
+        if (!outFile)
+        {
+            std::cerr << "Error flushing data to file!" << std::endl;
             return;
         }       
-    }
-
-    
+    }    
         
     outFile.close();
+}
+
+
+
+void CompareFiles(string& inputFile, string& outputFile, Measure& Measurement)
+{
+    ifstream sourcefile(inputFile, ios::binary | ios::ate);
+    if (!sourcefile) {
+        cerr << "Failed to open input file!" << endl;
+        return;
+    }
+
+    uInt origSize = static_cast<uInt>(sourcefile.tellg());
+
+    vector<char> buffer_in(origSize);
+
+    sourcefile.seekg(ios::beg);
+
+    if (!sourcefile.read(buffer_in.data(), origSize)) { // считать данные в буфер
+        std::cerr << "Ошибка чтения файла: " << inputFile << "\n";
+        return;
+    }
+
+
+    ifstream outfile(outputFile, ios::binary | ios::ate);
+    if (!outfile) {
+        cerr << "Failed to open input file!" << endl;
+        return;
+    }
+
+    if (outfile.tellg() != origSize)
+    {
+        cout << "Achtung! File sizes mismatch! \n";
+    }     
+    else
+    {
+        outfile.seekg(ios::beg);
+        vector<char> buffer_out(origSize);
+        if (!outfile.read(buffer_out.data(), origSize)) { // считать данные в буфер
+            std::cerr << "Ошибка чтения файла: " << inputFile << "\n";
+            return;
+        }
+
+
+        bool areEqual = (buffer_in == buffer_out);
+        if (areEqual)
+            cout << "Both sides are identical :-) \n";
+        else
+        {
+            cout << "Source file and Output files are different! :( \n";
+            if (Measurement.containsNZeros(buffer_out, 20000))
+            {
+                cout << "Achtung! More than 20000 bytes are zero! \n";
+            }
+
+        }
+    }
+
+    sourcefile.close();
+    outfile.close();
 }
 
 
@@ -395,7 +468,9 @@ int main(int argc, char* argv[]) {
             thread consumer(consume, outputFile, ref(queue), ref(Measurement), compression, parts_size, ref(dummy));
             producer.join();
             consumer.join();
-        }       
+        }
+
+        CompareFiles(inputFile, outputFile, Measurement);
 
         if (compression)
         {

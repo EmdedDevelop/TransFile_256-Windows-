@@ -108,6 +108,10 @@ public:
         return ((static_cast<double>(compressed_size_total) / static_cast<double>(original_size_total)) * 100.0);
     }
 
+    bool containsNZeros(const std::vector<char>& buffer, int n) {
+        return std::count(buffer.begin(), buffer.end(), 0) > n;
+    }
+
 };
 
 class MemoryInBuffer : public std::streambuf {

@@ -12,6 +12,7 @@
 #include <istream>
 #include <streambuf>
 #include <stdexcept>
+//#include <array>
 #include <zlib.h>
 
 
@@ -81,11 +82,18 @@ public:
 class Measure {
     std::chrono::steady_clock::time_point start_time_;
 
-    int original_size_total;
-    int compressed_size_total;
+    uInt original_size_total = 0;
+    uInt compressed_size_total = 0;
 
 public:
-    Measure() : original_size_total(0), compressed_size_total(0) {};
+//   static constexpr std::array<uInt, 16> CorrectCounters = { 11634, 11635, 11632, 11634, 
+                                                       //11632, 11634, 11636, 11633, 
+                                                       //11635, 11634, 11637, 11635, 
+                                                       //11634, 11635, 11633, 11634 };
+
+//    Measure(uInt threads) {
+//        DecompressCounter.resize(threads);
+    Measure() = default;
 
     void startMeasure() {
         start_time_ = std::chrono::steady_clock::now();
@@ -96,10 +104,10 @@ public:
         return std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time_);
     }
 
-    void addOriginalSize(int bytesRead) {
+    void addOriginalSize(uInt bytesRead) {
         original_size_total += bytesRead;
     }
-    void addCompressedlSize(int bytesRead) {
+    void addCompressedSize(uInt bytesRead) {
         compressed_size_total += bytesRead;
     }
 
@@ -108,10 +116,9 @@ public:
         return ((static_cast<double>(compressed_size_total) / static_cast<double>(original_size_total)) * 100.0);
     }
 
-    bool containsNZeros(const std::vector<char>& buffer, int n) {
-        return std::count(buffer.begin(), buffer.end(), 0) > n;
-    }
-
+    //bool containsNZeros(const std::vector<char>& buffer, int n) {
+    //    return std::count(buffer.begin(), buffer.end(), 0) > n;
+    //}
 };
 
 class MemoryInBuffer : public std::streambuf {

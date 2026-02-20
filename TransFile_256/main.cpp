@@ -50,7 +50,7 @@ static void compressor(int compressor_id, MemoryInputStream& memStream, vector<c
         if (have_out > 0) {
             {   
                 lock_guard <mutex> lock(AddComp_mtx);
-                Measurement.addCompressedlSize(have_out);
+                Measurement.addCompressedSize(have_out);
             }
 
             vector<char> compressedChunk(outBuf.begin(), outBuf.begin() + have_out);
@@ -228,7 +228,7 @@ static void decompress(packet_256& packet, z_stream& strm, vector<char>& outBuf,
 }
 
 
-static void decompress_thread(int decompressor_id, MemoryOutputStream& memOutStream, vector<DecompressorData>& decompressorQueues)
+static void decompress_thread(const uInt decompressor_id, MemoryOutputStream& memOutStream, vector<DecompressorData>& decompressorQueues)
 {
 
     auto& data = decompressorQueues[decompressor_id];
@@ -239,7 +239,7 @@ static void decompress_thread(int decompressor_id, MemoryOutputStream& memOutStr
         return;
     }
 
-    while (!done)
+    while (true)
     {
         std::unique_lock<std::mutex> lock(data.mtx);
         data.cv.wait(lock, [&]() { return done || !data.packetQueue.empty(); });
@@ -305,11 +305,7 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
     {
         uint8_t compress_id = compressedChunk.compressor_id;
         const uint8_t dataSize = CHUNK;
-        bool allZero = all_of(compressedChunk.data, compressedChunk.data + dataSize, [](char c) { return c == 0; });
-        if (allZero)
-        {
-            cout << "Received Zeroed chunk \n";
-        }
+        //bool allZero = all_of(compressedChunk.data, compressedChunk.data + dataSize, [](char c) { return c == 0; });
         {
             lock_guard<mutex> lock(decompressorQueues[compress_id].mtx);
             decompressorQueues[compress_id].packetQueue.push(move(compressedChunk));
@@ -335,11 +331,6 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
     uInt memSize = parts_size.partSize;
     for (uint8_t id = 0; id < partsAndSize.ThreadsNum; id++)
     {
-        if (Measurement.containsNZeros(buffers[id], 20000))
-        {
-            cout << "Achtung! More than 20000 bytes are zero in buffers[" << static_cast<uInt>(id) << "] \n";
-        }
-
         if (id == partsAndSize.ThreadsNum - 1)
         { 
             memSize = parts_size.residue;
@@ -354,12 +345,12 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
             return;
         }
 
-        outFile.flush();
-        if (!outFile)
-        {
-            std::cerr << "Error flushing data to file!" << std::endl;
-            return;
-        }       
+        //outFile.flush();
+        //if (!outFile)
+        //{
+        //    std::cerr << "Error flushing data to file!" << std::endl;
+        //    return;
+        //}       
     }    
         
     outFile.close();
@@ -406,18 +397,12 @@ void CompareFiles(string& inputFile, string& outputFile, Measure& Measurement)
             return;
         }
 
-
         bool areEqual = (buffer_in == buffer_out);
         if (areEqual)
-            cout << "Both sides are identical :-) \n";
+            cout << "Source and decompressed files are identical :-) \n";
         else
-        {
+        {            
             cout << "Source file and Output files are different! :( \n";
-            if (Measurement.containsNZeros(buffer_out, 20000))
-            {
-                cout << "Achtung! More than 20000 bytes are zero! \n";
-            }
-
         }
     }
 

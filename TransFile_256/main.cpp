@@ -302,7 +302,7 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
     if (!compression) {
         SimplyPaster(queue, outFile);
         auto duration = Measurement.finishMeasure();
-        cout << "[TIME] Полное время от начала до конца передачи (несжатых данных): " << duration.count() << "мс \n";
+        cout << "[TIME] Полное время от начала передачи до конца приёма несжатых данных: " << duration.count() << "мс \n";
         return;
     }
         

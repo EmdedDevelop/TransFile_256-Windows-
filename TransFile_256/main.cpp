@@ -464,7 +464,7 @@ int main(int argc, char* argv[]) {
 
     if (argc != 4) {
         cerr << "Ошибка: укажите входной, выходной файлы и установите флаг для компрессии \n";
-        cerr << "Пример использования: ./TF_256 [source_file] [output_file] [compression_flag]  \n";
+        cerr << "Пример использования: TransFile_256.exe [source_file] [output_file] [compression_flag]  \n";
         cerr << "[compression flag: 1 - использовать компрессию, 0 - пересылать данные без сжатия] \n";
         return 1;
     }

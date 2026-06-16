@@ -446,7 +446,7 @@ static void PerfomanceStats(bool compression, Measure &Measurement, SafeQueue<pa
 
     std::cout << "[MEMORY] Пиковая загрузка очереди: " << peak_packets << " пакетов ";
     std::cout << "(использовано ОЗУ: " << peak_bytes << " байт)\n";
-    std::cout << "[THREAD] Поток Потребителя блокировался (ждал данные): " << wait_chunks << " раз\n";
+    std::cout << "[THREAD] Поток Потребителя блокировался (ждал данные): " << wait_chunks << " раз(а)\n";
 
     if (compression)
     {

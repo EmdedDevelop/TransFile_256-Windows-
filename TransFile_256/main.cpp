@@ -11,6 +11,7 @@
 #include <future>
 #include <streambuf>
 #include "main.h"
+#include <cassert>
 
 
 using namespace std;
@@ -372,7 +373,7 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
 
 
 
-static void VerifyFiles(string& inputFile, string& outputFile, Measure& Measurement)
+static void verifyFiles(string& inputFile, string& outputFile, Measure& Measurement)
 {
     cout << "[VERIFY] ";
 
@@ -428,7 +429,7 @@ static void VerifyFiles(string& inputFile, string& outputFile, Measure& Measurem
 }
 
 
-static void PerfomanceStats(bool compression, Measure &Measurement, SafeQueue<packet_256> &queue)
+static void perfomanceStats(bool compression, Measure &Measurement, SafeQueue<packet_256> &queue)
 {
     size_t peak_packets = queue.get_max_utilization();
     size_t peak_bytes = peak_packets * 256;
@@ -456,11 +457,116 @@ static void PerfomanceStats(bool compression, Measure &Measurement, SafeQueue<pa
 }
 
 
+static void runInternalTests()
+{
+	std::cout << "[TEST] --------------------------------------------------\n";
+	std::cout << "[TEST] Шаг 1: Тестирование SafeQueue на пограничные режимы\n";
+	{
+		SafeQueue<int> test_queue;
+
+		// Тест 1.1: Проверка корректности push/pop в рамках одного потока
+		test_queue.push(42);
+		test_queue.push(100);
+
+		int value1 = 0;
+		int value2 = 0;
+
+		assert(test_queue.pop(value1) == true);
+		assert(value1 == 42); // Очередь должна вернуть первый зашедший элемент (FIFO)
+
+		assert(test_queue.pop(value2) == true);
+		assert(value2 == 100);
+
+		// Тест 1.2: Проверка корректного закрытия очереди через setFinished
+		test_queue.setFinished();
+		int dummy = 0;
+		// После setFinished() и опустошения очереди метод pop должен возвращать false
+		assert(test_queue.pop(dummy) == false);
+
+		std::cout << "[TEST] Базовые тесты SafeQueue: УСПЕШНО\n";
+	}
+
+	std::cout << "[TEST] --------------------------------------------------\n";
+	std::cout << "[TEST] Шаг 2: Тестирование сквозной потоковой компрессии zlib\n";
+	{
+		// Имитируем наш 256-байтовый пакет данных
+		std::string original_text = "Senior Embedded Engineer. STM32, C++, Real-Time Systems. Fryazino 2026.";
+
+		// Структуры zlib для deflate (сжатие)
+		z_stream def_strm;
+		def_strm.zalloc = Z_NULL;
+		def_strm.zfree = Z_NULL;
+		def_strm.opaque = Z_NULL;
+
+		// Инициализируем компрессор (используем уровень 4, как в вашем боевом коде)
+		int init_res = deflateInit(&def_strm, 4);
+		assert(init_res == Z_OK);
+
+		char compress_buffer[512];
+		def_strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(original_text.data()));
+		def_strm.avail_in = original_text.size();
+		def_strm.next_out = reinterpret_cast<Bytef*>(compress_buffer);
+		def_strm.avail_out = sizeof(compress_buffer);
+
+		// Сжимаем данные
+		int def_res = deflate(&def_strm, Z_FINISH);
+		assert(def_res == Z_STREAM_END); // Алгоритм обязан успешно дойти до конца потока
+
+		size_t compressed_size = sizeof(compress_buffer) - def_strm.avail_out;
+		deflateEnd(&def_strm);
+
+		assert(compressed_size > 0); // Проверяем, что сжатый буфер не пустой
+		std::cout << "[TEST] Потоковый deflateInit и deflate: УСПЕШНО\n";
+
+		// ---------------------------------------------------------------------
+		// Теперь имитируем разжатие (inflate) на приёмной стороне
+		z_stream inf_strm;
+		inf_strm.zalloc = Z_NULL;
+		inf_strm.zfree = Z_NULL;
+		inf_strm.opaque = Z_NULL;
+		inf_strm.avail_in = 0;
+		inf_strm.next_in = Z_NULL;
+
+		int inf_init_res = inflateInit(&inf_strm);
+		assert(inf_init_res == Z_OK);
+
+		char decompress_buffer[512];
+		inf_strm.next_in = reinterpret_cast<Bytef*>(compress_buffer);
+		inf_strm.avail_in = compressed_size;
+		inf_strm.next_out = reinterpret_cast<Bytef*>(decompress_buffer);
+		inf_strm.avail_out = sizeof(decompress_buffer);
+
+		int inf_res = inflate(&inf_strm, Z_FINISH);
+		assert(inf_res == Z_STREAM_END); // Проверяем, что разжатие завершилось без битых байт
+
+		size_t decompressed_size = sizeof(decompress_buffer) - inf_strm.avail_out;
+		inflateEnd(&inf_strm);
+
+		// Финальный побайтовый контроль совпадения данных бит-в-бит
+		assert(decompressed_size == original_text.size());
+		std::string recovered_text(decompress_buffer, decompressed_size);
+		assert(recovered_text == original_text);
+
+		std::cout << "[TEST] Потоковый inflateInit, inflate и верификация: УСПЕШНО\n";
+	}
+
+	std::cout << "[TEST] --------------------------------------------------\n";
+	std::cout << "[TEST] Все внутренние изолированные юнит-тесты пройдены успешно!\n";
+	std::cout << "[TEST] --------------------------------------------------\n";
+}
+
 
 
 int main(int argc, char* argv[]) {
 
     setlocale(LC_ALL, "ru");
+
+    if (argc == 2 && std::string(argv[1]) == "--test") {
+        std::cout << "[TEST] Запуск режима самотестирования...\n";
+
+        runInternalTests();
+        return 0;
+    }
 
     if (argc != 4) {
         cerr << "Ошибка: укажите входной, выходной файлы и установите флаг для компрессии \n";
@@ -502,8 +608,8 @@ int main(int argc, char* argv[]) {
                 consumer.join();
             }
 
-            PerfomanceStats(compression, ref(Measurement), ref(queue));
-            VerifyFiles(inputFile, outputFile, Measurement);
+            perfomanceStats(compression, ref(Measurement), ref(queue));
+            verifyFiles(inputFile, outputFile, Measurement);
         }
         else
         {

@@ -15,11 +15,13 @@
 
 using namespace std;
 
-constexpr uInt CHUNK = packet_256::DATA_SIZE;
-constexpr uint8_t WishThreads = 16;
-mutex AddComp_mtx, AddOrig_mtx;
-parts_and_size parts_size = {};
-bool done(false);
+static constexpr uInt CHUNK = packet_256::DATA_SIZE;
+static constexpr uint8_t WishThreads = 16;
+static mutex AddComp_mtx, AddOrig_mtx;
+static parts_and_size parts_size = {};
+static bool done(false);
+static size_t FileSize;
+
 
 
 static void compressor(int compressor_id, MemoryInputStream& memStream, vector<char>& inBuf, vector<char>& outBuf, z_stream& def_strm, int& flush,
@@ -126,26 +128,43 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         return;
     }
 
-    streamsize origSize = in.tellg();
+    FileSize = in.tellg();
 
-    if (origSize <= 0) {
-        cerr << "Файл пустой или ошибка определения размера: " << inputFile << endl;
+    if (FileSize <= 0) {
+        cerr << "Исходный файл пустой или ошибка определения размера: " << inputFile << endl;
+        in.close();
+
+        parts_and_size empty_parts_size{};
+        empty_parts_size.ThreadsNum = 0;
+        empty_parts_size.partSize = 0;
+        empty_parts_size.residue = 0;
+        sizePromise.set_value(empty_parts_size);
+
+        Measurement.startMeasure();
+        queue.setFinished();
         return;
     }
 
     in.seekg(0, ios::beg);
     
     if (!compression) {
+        parts_and_size non_compressed_size{};
+        non_compressed_size.ThreadsNum = 1;
+        non_compressed_size.partSize = static_cast<uInt>(FileSize);
+        non_compressed_size.residue = static_cast<uInt>(FileSize);
+        // Передаем значение, чтобы убрать future_error в main
+        sizePromise.set_value(non_compressed_size);
+
         Measurement.startMeasure();
-        SimplyCopier(in, inputFile, queue, origSize);
+        SimplyCopier(in, inputFile, queue, FileSize);
         return;
     }
 
 
     vector<vector<char>> buffers;
     vector<thread> compressors;
-    uInt portion_size = static_cast<uInt>(origSize / ThreadsNum);
-    uint8_t residue = origSize % ThreadsNum;
+    uInt portion_size = static_cast<uInt>(FileSize / ThreadsNum);
+    uint8_t residue = FileSize % ThreadsNum;
     parts_size.ThreadsNum = (residue == 0) ? ThreadsNum : (ThreadsNum + 1);
     parts_size.partSize = static_cast<uInt>(portion_size);
     parts_size.residue = (residue == 0) ? portion_size : residue;
@@ -184,7 +203,7 @@ static void produce(const string& inputFile, SafeQueue<packet_256>& queue, Measu
         }
 
         compressors.emplace_back(compress_thread, portionNumber, ref(*memStream[portionNumber]),
-            ref(def_strm[portionNumber]), ref(queue), std::ref(Measurement));
+            ref(def_strm[portionNumber]), ref(queue), ref(Measurement));
     }
 
     in.close();
@@ -282,7 +301,8 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
 
     if (!compression) {
         SimplyPaster(queue, outFile);
-        cout << "Полное время от начала до конца передачи (несжатых данных): " << Measurement.finishMeasure() << endl;
+        auto duration = Measurement.finishMeasure();
+        cout << "[TIME] Полное время от начала до конца передачи (несжатых данных): " << duration.count() << "мс \n";
         return;
     }
         
@@ -326,8 +346,6 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
             t.join();
     }
 
-    cout << "Полное время от начала сжатия до завершения разжатия: " << Measurement.finishMeasure() << " \n";
-
     uInt memSize = parts_size.partSize;
     for (uint8_t id = 0; id < partsAndSize.ThreadsNum; id++)
     {
@@ -344,22 +362,20 @@ static void consume(const string& outputFile, SafeQueue<packet_256>& queue, Meas
             std::cerr << "Error writing decompressed data!" << std::endl;
             return;
         }
-
-        //outFile.flush();
-        //if (!outFile)
-        //{
-        //    std::cerr << "Error flushing data to file!" << std::endl;
-        //    return;
-        //}       
     }    
         
     outFile.close();
+
+    auto duration = Measurement.finishMeasure();
+    cout << "[TIME] Полное время от начала сжатия до завершения разжатия: " << duration.count() << " мс \n";
 }
 
 
 
-void CompareFiles(string& inputFile, string& outputFile, Measure& Measurement)
+static void VerifyFiles(string& inputFile, string& outputFile, Measure& Measurement)
 {
+    cout << "[VERIFY] ";
+
     ifstream sourcefile(inputFile, ios::binary | ios::ate);
     if (!sourcefile) {
         cerr << "Failed to open input file!" << endl;
@@ -386,7 +402,7 @@ void CompareFiles(string& inputFile, string& outputFile, Measure& Measurement)
 
     if (outfile.tellg() != origSize)
     {
-        cout << "Achtung! File sizes mismatch! \n";
+        cout << "Размеры входного и выходного файла отличаются! \n";
     }     
     else
     {
@@ -398,16 +414,45 @@ void CompareFiles(string& inputFile, string& outputFile, Measure& Measurement)
         }
 
         bool areEqual = (buffer_in == buffer_out);
+        cout << "Исходный и выходной файл ";
         if (areEqual)
-            cout << "Source and decompressed files are identical :-) \n";
+            cout << "идентичны :) \n";
         else
         {            
-            cout << "Source file and Output files are different! :( \n";
+            cout << "отличаются :( \n";
         }
     }
 
     sourcefile.close();
     outfile.close();
+}
+
+
+static void PerfomanceStats(bool compression, Measure &Measurement, SafeQueue<packet_256> &queue)
+{
+    size_t peak_packets = queue.get_max_utilization();
+    size_t peak_bytes = peak_packets * 256;
+    size_t wait_chunks = queue.get_consumer_wait_count();
+
+    if (Measurement.total_time_sec > 0) {
+        double file_size_mb = static_cast<double>(FileSize) / (1024.0 * 1024.0);
+
+        // Вычисляем чистую скорость обработки потока
+        double throughput = file_size_mb / Measurement.total_time_sec;
+
+        std::cout << "[PERF] Скорость обработки потока: " << std::fixed << std::setprecision(2)
+            << throughput << " МБ/сек\n";
+    }
+
+    std::cout << "[MEMORY] Пиковая загрузка очереди: " << peak_packets << " пакетов ";
+    std::cout << "(использовано ОЗУ: " << peak_bytes << " байт)\n";
+    std::cout << "[THREAD] Поток Потребителя блокировался (ждал данные): " << wait_chunks << " раз\n";
+
+    if (compression)
+    {
+        cout << fixed << setprecision(1);
+        cout << "[STATS] Процент сжатия = " << Measurement.CalculateCompressPercent() << "% \n";
+    }
 }
 
 
@@ -419,7 +464,7 @@ int main(int argc, char* argv[]) {
 
     if (argc != 4) {
         cerr << "Ошибка: укажите входной, выходной файлы и установите флаг для компрессии \n";
-        cerr << "Пример использования: TransFile_256 [source_file] [consumer_file] [compression_flag]  \n";
+        cerr << "Пример использования: ./TF_256 [source_file] [output_file] [compression_flag]  \n";
         cerr << "[compression flag: 1 - использовать компрессию, 0 - пересылать данные без сжатия] \n";
         return 1;
     }
@@ -438,30 +483,33 @@ int main(int argc, char* argv[]) {
         Measure Measurement;
 
         thread producer(produce, ref(inputFile), ref(queue), ref(Measurement), compression, move(sizePromise), ThreadsNum);
+        parts_and_size parts_size = sizeFuture.get();
 
-        if (compression)
+        if (parts_size.ThreadsNum > 0)
         {
-            parts_and_size parts_size = sizeFuture.get();
-            vector<DecompressorData> decompressorQueues(parts_size.ThreadsNum);
-            thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression, parts_size, ref(decompressorQueues));
-            producer.join();
-            consumer.join();
-        }  
+            if (compression)
+            {
+                vector<DecompressorData> decompressorQueues(parts_size.ThreadsNum);
+                thread consumer(consume, ref(outputFile), ref(queue), ref(Measurement), compression, parts_size, ref(decompressorQueues));
+                producer.join();
+                consumer.join();
+            }
+            else
+            {
+                vector<DecompressorData> dummy; // пустые данные не нужны
+                thread consumer(consume, outputFile, ref(queue), ref(Measurement), compression, parts_size, ref(dummy));
+                producer.join();
+                consumer.join();
+            }
+
+            PerfomanceStats(compression, ref(Measurement), ref(queue));
+            VerifyFiles(inputFile, outputFile, Measurement);
+        }
         else
         {
-            vector<DecompressorData> dummy; // пустые данные не нужны
-            thread consumer(consume, outputFile, ref(queue), ref(Measurement), compression, parts_size, ref(dummy));
             producer.join();
-            consumer.join();
         }
 
-        CompareFiles(inputFile, outputFile, Measurement);
-
-        if (compression)
-        {
-            cout << fixed << setprecision(1);
-            cout << "Процент сжатия = " << Measurement.CalculateCompressPercent() << "% \n";
-        }
 
     }
     return 0;

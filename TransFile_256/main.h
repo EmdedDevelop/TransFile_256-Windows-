@@ -12,7 +12,6 @@
 #include <istream>
 #include <streambuf>
 #include <stdexcept>
-//#include <array>
 #include <zlib.h>
 
 
@@ -46,19 +45,35 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     bool finished_ = false;
+    // МЕТРИКА
+    size_t max_queue_utilization = 0;
+    size_t consumer_wait_count = 0;
+
 
 public:
     void push(T&& item) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             queue_.push(std::move(item));
+            // МЕТРИКА: Фиксируем пиковое количество элементов в очереди
+            if (queue_.size() > max_queue_utilization) {
+                max_queue_utilization = queue_.size();
+            }
         }
         cv_.notify_one();
     }
 
     bool pop(T& item) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&]() { return !queue_.empty() || finished_; });
+
+        // Вставляем инкремент прямо в лямбду предиката
+        cv_.wait(lock, [&]() {
+            bool condition = !queue_.empty() || finished_;
+            if (!condition) {
+                consumer_wait_count++; // Очередь пуста — поток сейчас уйдет в сон
+            }
+            return condition;
+            });
 
         if (queue_.empty() && finished_)
             return false;
@@ -75,6 +90,17 @@ public:
         }
         cv_.notify_all();
     }
+
+    size_t get_max_utilization() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return max_queue_utilization;
+    }
+
+    size_t get_consumer_wait_count() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return consumer_wait_count;
+    }
+
 };
 
 
@@ -86,6 +112,7 @@ class Measure {
     uInt compressed_size_total = 0;
 
 public:
+    double total_time_sec;
 //   static constexpr std::array<uInt, 16> CorrectCounters = { 11634, 11635, 11632, 11634, 
                                                        //11632, 11634, 11636, 11633, 
                                                        //11635, 11634, 11637, 11635, 
@@ -99,9 +126,11 @@ public:
         start_time_ = std::chrono::steady_clock::now();
     }
 
-    std::chrono::milliseconds finishMeasure() const {
+    std::chrono::milliseconds finishMeasure() {
         auto end_time = std::chrono::steady_clock::now();
-        return std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time_);
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time_);
+        total_time_sec = static_cast<double>(duration.count()) / 1000.0;
+        return duration;
     }
 
     void addOriginalSize(uInt bytesRead) {
